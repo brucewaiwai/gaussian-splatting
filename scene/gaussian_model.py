@@ -13,6 +13,8 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+from PIL import Image
+import matplotlib.pylab as plt
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -20,7 +22,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
+from scipy.spatial.transform import Rotation
 class GaussianModel:
 
     def setup_functions(self):
@@ -42,20 +44,21 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int):
-        self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
-        self.optimizer = None
-        self.percent_dense = 0
-        self.spatial_lr_scale = 0
+        self.active_sh_degree = 0 # 目前的球谐阶数，在`oneupSHdegree()`方法中加一
+        	# SH = Sphere Harmonics
+        self.max_sh_degree = sh_degree  # 最大可能达到的的球谐阶数
+        self._xyz = torch.empty(0)  # 每个Gaussian的中心坐标
+        self._features_dc = torch.empty(0) # 球谐的直流分量（dc = Direct Current）
+        self._features_rest = torch.empty(0)  # 球谐的其他高阶特征
+        self._scaling = torch.empty(0) # 缩放参数
+        self._rotation = torch.empty(0) # 旋转参数（一系列四元数）
+        self._opacity = torch.empty(0) # 不透明度（经历sigmoid前的）
+        self.max_radii2D = torch.empty(0) # 在某个相机视野里出现过的（像平面上的）最大2D半径，详见train.py里面gaussians.max_radii2D[visibility_filter] = ...一行
+        self.xyz_gradient_accum = torch.empty(0)  # 每个Gaussian的坐标梯度积累，当它太大的时候要对Gaussian进行分裂或复制（见论文5.2节
+        self.denom = torch.empty(0) # 与累积梯度配合使用，表示统计了多少次累积梯度，算平均梯度时除掉这个（denom = denominator，分母）
+        self.optimizer = None # 优化器（论文中采用Adam，见附录B Algorithm 1的伪代码）
+        self.percent_dense = 0 # 参与控制Gaussian密集程度的超参数
+        self.spatial_lr_scale = 0 # 坐标的学习率要乘上这个，抵消在不同尺度下应用同一个学习率带来的问题
         self.setup_functions()
 
     def capture(self):
@@ -125,6 +128,9 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        # print(torch.max(fused_point_cloud))
+        print(f'fused_point_cloud: {fused_point_cloud.shape}')
+        print(f'fused_color: {fused_color.shape}')
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
@@ -145,6 +151,121 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+    def create_from_random(self, num_points, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale
+        # fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        # fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+
+        fused_point_cloud = torch.randn(num_points,3).float().cuda()
+        fused_color = RGB2SH(torch.randn(num_points,3).float().cuda())
+        
+        print(f'fused_point_cloud: {fused_point_cloud.shape}')
+        print(f'fused_color: {fused_color.shape}')
+        
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(torch.randn(num_points,3).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+    def create_from_depth(self, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale
+        
+        nerf_dir = "data/slide_block_to_color_target_64_2/"
+        rgbs = []
+        pcds = []
+        for i in range(0,63,20):
+            nerf_camera_dir = os.path.join(nerf_dir, f"poses/{i}.txt")
+            nerf_depth_dir = os.path.join(nerf_dir, f"depths/{i}.png")
+            nerf_rgb_dir = os.path.join(nerf_dir, f"images/{i}.png")
+            # print(f'nerf_camera_dir: {nerf_camera_dir}')
+            # print(f'nerf_depth_dir: {nerf_depth_dir}')
+            camera_extrinsic, camera_intrinsic, focal = parse_camera_file(nerf_camera_dir)
+            # colmap_camera_extrinsic = sim_to_colmap(camera_extrinsic)
+            
+            # R = camera_extrinsic[:3, :3]
+            # t = camera_extrinsic[:3, 3]
+            # print(f't: {t}')
+            depth = image_to_float_array(Image.open(nerf_depth_dir))
+            near = 0
+            far = 10
+            depth_m = near + depth * (far - near)
+            rgb = np.array(Image.open(nerf_rgb_dir))/255
+            rgbs.append(rgb.reshape(-1,3))
+            pcd = pointcloud_from_depth_and_camera_params(depth_m,camera_extrinsic,camera_intrinsic)
+            pcds.append(pcd.reshape(-1,3))
+
+        rgb = np.concatenate(rgbs, axis=0)
+        pcd = np.concatenate(pcds, axis=0)
+
+        # t = np.array([0.0,0,-4.5])
+
+        # R_flip = Rotation.from_euler('z', 180, degrees=True).as_matrix()
+        # t = np.array([0, 0.3, 1.8])
+        # pcd = np.matmul(pcd,R_flip)
+        # pcd = transform_pointcloud(pcd,colmap_camera_extrinsic)
+        # pcd = pcd*2.5 + t
+        # plt.subplot(121)
+        # plt.imshow(rgb)
+        # plt.subplot(122)
+        # plt.imshow(pcd)
+        # plt.show()
+
+
+        
+        print(f'depth: {depth.shape}')
+        print(f'pcd: {pcd.shape}')
+        print(f'rgb: {rgb.shape}')
+        # rgb
+        fused_point_cloud = torch.tensor(np.asarray(pcd)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(rgb)).float().cuda())
+        # fused_point_cloud = torch.randn(num_points,3).float().cuda()
+        # fused_color = RGB2SH(torch.randn(16384,3).float().cuda())
+        
+        print(f'max point:{torch.max(fused_point_cloud,dim=0)}')
+        print(f'fused_point_cloud: {fused_point_cloud.shape}')
+        print(f'fused_color: {fused_color.shape}')
+        
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        
+        
+        
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -405,3 +526,192 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+        
+        
+        
+        
+def transform_pointcloud(points, T):
+    """
+    Transforms a point cloud using the given transformation matrix.
+    
+    Parameters:
+    points (numpy.ndarray): Nx3 array of 3D points in CoppeliaSim coordinate system
+    T (numpy.ndarray): 4x4 transformation matrix (inverted from CoppeliaSim camera-to-world to world-to-camera)
+    
+    Returns:
+    numpy.ndarray: Nx3 array of transformed points in COLMAP coordinate system
+    """
+    points = points.reshape(-1,3)
+    # Convert the point cloud to homogeneous coordinates (Nx4)
+    num_points = points.shape[0]
+    points_homogeneous = np.hstack([points, np.ones((num_points, 1))])
+    
+    # Apply the transformation matrix to each point
+    transformed_points_homogeneous = (T @ points_homogeneous.T).T
+    # print(transformed_points_homogeneous.shape)
+    # Return the transformed points (drop the homogeneous coordinate)
+    return transformed_points_homogeneous[:, :3]
+
+
+
+def sim_to_colmap(extrinsics):
+    R = extrinsics[:3, :3]
+    t = extrinsics[:3, 3]
+
+    # Invert the rotation matrix (transpose, since it's orthogonal)
+    R_inv = R.T
+
+    # Compute the new translation vector
+    # t_inv = -np.dot(R_inv, t)
+    t_inv = -R_inv @ t
+
+    R_flip = Rotation.from_euler('z', 180, degrees=True).as_matrix()
+    R_inv = R_flip @ R_inv
+
+    # Form the inverted transformation matrix
+    extrinsics = np.eye(4)
+    # print(extrinsics)
+    extrinsics[:3, :3] = R_inv
+    extrinsics[:3, 3] = t_inv
+    
+    return extrinsics
+        
+def pointcloud_from_depth_and_camera_params(
+        depth: np.ndarray, extrinsics: np.ndarray,
+        intrinsics: np.ndarray) -> np.ndarray:
+    """Converts depth (in meters) to point cloud in word frame.
+    :return: A numpy array of size (width, height, 3)
+    """
+    # make sure intrinsic is non-negative
+    upc = _create_uniform_pixel_coords_image(depth.shape)
+    pc = upc * np.expand_dims(depth, -1)
+    C = np.expand_dims(extrinsics[:3, 3], 0).T
+    R = extrinsics[:3, :3]
+    R_inv = R.T  # inverse of rot matrix is transpose
+    R_inv_C = np.matmul(R_inv, C)
+    extrinsics = np.concatenate((R_inv, -R_inv_C), -1)
+    cam_proj_mat = np.matmul(intrinsics, extrinsics)
+    cam_proj_mat_homo = np.concatenate(
+        [cam_proj_mat, [np.array([0, 0, 0, 1])]])
+    cam_proj_mat_inv = np.linalg.inv(cam_proj_mat_homo)[0:3]
+    world_coords_homo = np.expand_dims(_pixel_to_world_coords(
+        pc, cam_proj_mat_inv), 0)
+    world_coords = world_coords_homo[..., :-1][0]
+    return world_coords
+    
+def _create_uniform_pixel_coords_image(resolution: np.ndarray):
+    pixel_x_coords = np.reshape(
+        np.tile(np.arange(resolution[1]), [resolution[0]]),
+        (resolution[0], resolution[1], 1)).astype(np.float32)
+    
+    pixel_y_coords = np.reshape(
+        np.tile(np.arange(resolution[0]), [resolution[1]]),
+        (resolution[1], resolution[0], 1)).astype(np.float32)
+    
+    pixel_y_coords = np.transpose(pixel_y_coords, (1, 0, 2))
+    # uniform_pixel_coords = np.concatenate(
+    #     (pixel_x_coords, pixel_y_coords, np.ones_like(pixel_x_coords)), -1)
+    uniform_pixel_coords = np.concatenate(
+        (pixel_x_coords, pixel_y_coords, np.ones_like(pixel_x_coords)), -1)
+    
+    # print(f'uniform_pixel_coords:{uniform_pixel_coords.shape}')
+    return uniform_pixel_coords
+
+def _transform(coords, trans):
+    h, w = coords.shape[:2]
+    coords = np.reshape(coords, (h * w, -1))
+    coords = np.transpose(coords, (1, 0))
+    transformed_coords_vector = np.matmul(trans, coords)
+    transformed_coords_vector = np.transpose(
+        transformed_coords_vector, (1, 0))
+    return np.reshape(transformed_coords_vector,
+                      (h, w, -1))
+    
+def _pixel_to_world_coords(pixel_coords, cam_proj_mat_inv):
+    h, w = pixel_coords.shape[:2]
+    pixel_coords = np.concatenate(
+        [pixel_coords, np.ones((h, w, 1))], -1)
+    world_coords = _transform(pixel_coords, cam_proj_mat_inv)
+    world_coords_homo = np.concatenate(
+        [world_coords, np.ones((h, w, 1))], axis=-1)
+    return world_coords_homo
+
+def parse_camera_file(file_path):
+    """
+    Parse our camera format.
+
+    The format is (*.txt):
+    
+    4x4 matrix (camera extrinsic)
+    space
+    3x3 matrix (camera intrinsic)
+
+    focal is extracted from the intrinsc matrix
+    """
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    camera_extrinsic = []
+    for x in lines[0:4]:
+        camera_extrinsic += [float(y) for y in x.split()]
+    camera_extrinsic = np.array(camera_extrinsic).reshape(4, 4)
+
+    camera_intrinsic = []
+    for x in lines[5:8]:
+        camera_intrinsic += [float(y) for y in x.split()]
+    camera_intrinsic = np.array(camera_intrinsic).reshape(3, 3)
+    # print(f'camera_intrinsic:{camera_intrinsic}')
+    # camera_intrinsic[0,0]*=-1
+    # camera_intrinsic[1,1]*=-1
+    # print(f'camera_intrinsic:{camera_intrinsic}')
+    focal = camera_intrinsic[0, 0]
+
+    return camera_extrinsic, camera_intrinsic, focal
+
+
+DEFAULT_RGB_SCALE_FACTOR = 256000.0
+DEFAULT_GRAY_SCALE_FACTOR = {np.uint8: 100.0,
+                             np.uint16: 1000.0,
+                             np.int32: DEFAULT_RGB_SCALE_FACTOR}
+DEPTH_SCALE = 2**24 - 1
+def image_to_float_array(image, scale_factor=DEPTH_SCALE):
+  """Recovers the depth values from an image.
+
+  Reverses the depth to image conversion performed by FloatArrayToRgbImage or
+  FloatArrayToGrayImage.
+
+  The image is treated as an array of fixed point depth values.  Each
+  value is converted to float and scaled by the inverse of the factor
+  that was used to generate the Image object from depth values.  If
+  scale_factor is specified, it should be the same value that was
+  specified in the original conversion.
+
+  The result of this function should be equal to the original input
+  within the precision of the conversion.
+
+  Args:
+    image: Depth image output of FloatArrayTo[Format]Image.
+    scale_factor: Fixed point scale factor.
+
+  Returns:
+    A 2D floating point numpy array representing a depth image.
+
+  """
+  image_array = np.array(image)
+  image_dtype = image_array.dtype
+  image_shape = image_array.shape
+#   print(f'Image shape:{image_shape}')
+
+  channels = image_shape[2] if len(image_shape) > 2 else 1
+  assert 2 <= len(image_shape) <= 3
+  if channels == 3:
+    # RGB image needs to be converted to 24 bit integer.
+    float_array = np.sum(image_array * [65536, 256, 1], axis=2)
+    if scale_factor is None:
+      scale_factor = DEFAULT_RGB_SCALE_FACTOR
+  else:
+    if scale_factor is None:
+      scale_factor = DEFAULT_GRAY_SCALE_FACTOR[image_dtype.type]
+    float_array = image_array.astype(np.float32)
+  scaled_array = float_array / scale_factor
+  return scaled_array

@@ -24,7 +24,9 @@ from gaussian_renderer import GaussianModel
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-
+    
+    print(f'render_path: {render_path}')
+    
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
@@ -33,6 +35,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        # print(os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

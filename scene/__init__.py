@@ -14,7 +14,7 @@ import random
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
+from scene.gaussian_model import GaussianModel, image_to_float_array
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=False, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -39,7 +39,10 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
-
+        
+        self.train_depth_cameras = {}
+        self.test_depth_cameras = {}
+        
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
@@ -49,38 +52,59 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            # with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+            #     dest_file.write(src_file.read())
             json_cams = []
             camlist = []
+            depth_camlist = []
+            
             if scene_info.test_cameras:
                 camlist.extend(scene_info.test_cameras)
+                depth_camlist.extend(scene_info.test_depth_cameras)
+                
             if scene_info.train_cameras:
                 camlist.extend(scene_info.train_cameras)
+                depth_camlist.extend(scene_info.train_depth_cameras)
+                
             for id, cam in enumerate(camlist):
                 json_cams.append(camera_to_JSON(id, cam))
+                
+            # for id, cam in enumerate(depth_camlist):
+            #     json_cams.append(camera_to_JSON(id, cam))
+                
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
 
         if shuffle:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
-
+            
+            random.shuffle(scene_info.train_depth_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(scene_info.test_depth_cameras)
+            
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+            self.train_depth_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_depth_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
-
+            self.test_depth_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_depth_cameras, resolution_scale, args)
+        
+        print(f'self.loaded_iter: {self.loaded_iter}')
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            print(f'scene_info: {scene_info.point_cloud}')
+            if scene_info.point_cloud is not None:
+                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            else:
+                self.gaussians.create_from_random(16384, self.cameras_extent)
+                # self.gaussians.create_from_depth(self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -91,3 +115,9 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+    def getTrainDepthCameras(self, scale=1.0):
+        return self.train_depth_cameras[scale]
+
+    def getTestDepthCameras(self, scale=1.0):
+        return self.test_depth_cameras[scale]

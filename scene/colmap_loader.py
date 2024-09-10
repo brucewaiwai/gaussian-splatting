@@ -246,6 +246,8 @@ def read_extrinsics_text(path):
     Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
     """
     images = {}
+    xys = None
+    point3D_ids = None
     with open(path, "r") as fid:
         while True:
             line = fid.readline()
@@ -259,10 +261,12 @@ def read_extrinsics_text(path):
                 tvec = np.array(tuple(map(float, elems[5:8])))
                 camera_id = int(elems[8])
                 image_name = elems[9]
-                elems = fid.readline().split()
-                xys = np.column_stack([tuple(map(float, elems[0::3])),
-                                       tuple(map(float, elems[1::3]))])
-                point3D_ids = np.array(tuple(map(int, elems[2::3])))
+
+                # elems = fid.readline().split()
+                # xys = np.column_stack([tuple(map(float, elems[0::3])),
+                #                     tuple(map(float, elems[1::3]))])
+                # point3D_ids = np.array(tuple(map(int, elems[2::3])))
+
                 images[image_id] = Image(
                     id=image_id, qvec=qvec, tvec=tvec,
                     camera_id=camera_id, name=image_name,

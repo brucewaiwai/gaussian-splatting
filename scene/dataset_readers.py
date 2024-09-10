@@ -39,6 +39,8 @@ class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
+    train_depth_cameras: list
+    test_depth_cameras: list
     nerf_normalization: dict
     ply_path: str
 
@@ -65,8 +67,9 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depth_images_folder):
     cam_infos = []
+    depth_cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -79,8 +82,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
+
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
+        # print(f'T:{T}')
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
@@ -97,12 +102,31 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
-
+        # image = image.rotate(-90, Image.NEAREST, expand = 1)
+        
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
+        
+
         cam_infos.append(cam_info)
+        
+        
+        try:
+            depth_image_path = os.path.join(depth_images_folder, os.path.basename(extr.name))
+            depth_image_name = os.path.basename(depth_image_path).split(".")[0]
+            depth_image = Image.open(depth_image_path)
+            # depth_image = depth_image.rotate(-90, Image.NEAREST, expand = 1)
+        
+            depth_cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=depth_image,
+                                    image_path=depth_image_path, image_name=depth_image_name, width=width, height=height)
+            depth_cam_infos.append(depth_cam_info)
+        except Exception as e:
+            print(e)
+        
+
+        
     sys.stdout.write('\n')
-    return cam_infos
+    return cam_infos, depth_cam_infos
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -140,17 +164,32 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
-
+        
+    # print(f'cam_intrinsics: {type(cam_intrinsics)} {cam_intrinsics.keys()} {cam_intrinsics[1]}')
+    # print(cam_intrinsics)
+    # print(f'cam_extrinsics: {type(cam_extrinsics)} {cam_extrinsics.keys()} {type(cam_extrinsics[1])}')
+    # print(cam_extrinsics)
+    
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    depth_reading_dir = "depths"
+    cam_infos_unsorted, depth_cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, 
+                                                                     cam_intrinsics=cam_intrinsics, 
+                                                                     images_folder=os.path.join(path, reading_dir), 
+                                                                     depth_images_folder=os.path.join(path, depth_reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    depth_cam_infos = sorted(depth_cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        
+        train_deoth_info = [c for idx, c in enumerate(depth_cam_infos) if idx % llffhold != 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
+        
+        train_deoth_info = depth_cam_infos
+        test_depth_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -162,8 +201,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+            # xyz, rgb, _ = read_points3D_text(txt_path)
+            xyz, rgb, _ = None, None, None
+        # storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
     except:
@@ -172,6 +212,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
+                           train_depth_cameras=train_deoth_info,
+                           test_depth_cameras=test_depth_cam_infos,  # depth cameras are not used for evaluation in this script, so we set it to None here.
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
